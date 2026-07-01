@@ -17,7 +17,7 @@
 
 -module(gen_tcp_server).
 
--export([start/4, start/3, start_link/4, start_link/3, stop/1]).
+-export([start/4, start/3, start_link/4, start_link/3, stop/1, send/2]).
 
 -behaviour(gen_server).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
@@ -47,6 +47,8 @@
     addr => any
 }).
 -define(DEFAULT_SOCKET_OPTIONS, #{}).
+-define(SEND_RETRY_LIMIT, 20).
+-define(SEND_RETRY_SLEEP_MS, 10).
 
 %%
 %% API
@@ -66,6 +68,10 @@ start_link(BindOptions, SocketOptions, Handler, Args) ->
 
 stop(Server) ->
     gen_server:stop(Server).
+
+-spec send(Socket :: term(), Packet :: iolist()) -> ok | {error, Reason :: term()}.
+send(Socket, Packet) ->
+    try_send(Socket, Packet).
 
 %%
 %% gen_server implementation
@@ -164,20 +170,7 @@ terminate(_Reason, _State) ->
 
 %% @private
 try_send(Socket, Packet) when is_binary(Packet) ->
-    ?TRACE(
-        "Trying to send binary packet data to socket ~p.  Packet (or len): ~p", [
-        Socket, case byte_size(Packet) < 32 of true -> Packet; _ -> byte_size(Packet) end
-    ]),
-    case socket:send(Socket, Packet) of
-        ok ->
-            ?TRACE("sent.", []),
-            ok;
-        {ok, Rest} ->
-            ?TRACE("sent.  remaining: ~p", [Rest]),
-            try_send(Socket, Rest);
-        Error ->
-            io:format("Send failed due to error ~p~n", [Error])
-    end;
+    try_send(Socket, Packet, ?SEND_RETRY_LIMIT);
 try_send(Socket, Char) when is_integer(Char) ->
     %% TODO handle unicode
     ?TRACE("Sending char ~p as ~p", [Char, <<Char:8>>]),
@@ -190,11 +183,44 @@ try_send(Socket, List) when is_list(List) ->
             try_send_iolist(Socket, List)
     end.
 
+try_send(Socket, Packet, RetriesLeft) ->
+    ?TRACE(
+        "Trying to send binary packet data to socket ~p.  Packet (or len): ~p", [
+        Socket, case byte_size(Packet) < 32 of true -> Packet; _ -> byte_size(Packet) end
+    ]),
+    case socket:send(Socket, Packet) of
+        ok ->
+            ?TRACE("sent.", []),
+            ok;
+        {ok, Packet} ->
+            retry_send(Socket, Packet, RetriesLeft);
+        {ok, Rest} ->
+            ?TRACE("sent.  remaining: ~p", [Rest]),
+            try_send(Socket, Rest, ?SEND_RETRY_LIMIT);
+        {error, eagain} ->
+            retry_send(Socket, Packet, RetriesLeft);
+        Error ->
+            io:format("Send failed due to error ~p~n", [Error]),
+            Error
+    end.
+
 try_send_iolist(_Socket, []) ->
     ok;
 try_send_iolist(Socket, [H | T]) ->
-    try_send(Socket, H),
-    try_send_iolist(Socket, T).
+    case try_send(Socket, H) of
+        ok ->
+            try_send_iolist(Socket, T);
+        Error ->
+            Error
+    end.
+
+retry_send(_Socket, _Packet, 0) ->
+    Error = {error, eagain},
+    io:format("Send failed due to transient backpressure after ~p retries~n", [?SEND_RETRY_LIMIT]),
+    Error;
+retry_send(Socket, Packet, RetriesLeft) ->
+    timer:sleep(?SEND_RETRY_SLEEP_MS),
+    try_send(Socket, Packet, RetriesLeft - 1).
 
 is_string([]) ->
     true;

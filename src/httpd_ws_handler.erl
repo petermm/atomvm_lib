@@ -230,7 +230,7 @@ octet(<<_:3/binary, Fourth:8, _/binary>>, 3) ->
 do_send(Socket, Packet, Mode) ->
     FramedPacket = frame(Packet, Mode),
     ?TRACE("Framed packet: [~s]", [atomvm_lib:to_hex(FramedPacket)]),
-    socket:send(Socket, FramedPacket).
+    gen_tcp_server:send(Socket, FramedPacket).
 
 %% @private
 frame(Packet, Mode) when is_list(Packet) ->
