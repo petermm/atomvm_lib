@@ -260,14 +260,23 @@ set_socket_options(Socket, SocketOptions) ->
 
 %% @private
 accept(ControllingProcess, ListenSocket) ->
+    accept(ControllingProcess, ListenSocket, 3).
+
+accept(ControllingProcess, ListenSocket, Retries) ->
     ?TRACE("pid ~p Waiting for connection on ~p ...", [self(), socket:sockname(ListenSocket)]),
     case socket:accept(ListenSocket) of
         {ok, Connection} ->
             ?TRACE("Accepted connection from ~p", [socket:peername(Connection)]),
-            spawn(fun() -> accept(ControllingProcess, ListenSocket) end),
+            spawn(fun() -> accept(ControllingProcess, ListenSocket, Retries) end),
             loop(ControllingProcess, Connection);
+        {error, closed} when Retries > 0 ->
+            %% A Wi-Fi glitch can report `closed' transiently; exiting here
+            %% leaves the listener bound but deaf, so retry a few times before
+            %% accepting that the listener is really gone.
+            ?TRACE("Listener ~p closed; retrying", [ListenSocket]),
+            receive after 1000 -> ok end,
+            accept(ControllingProcess, ListenSocket, Retries - 1);
         {error, closed} ->
-            %% The listener is gone; there is nothing left to accept.
             ?TRACE("Listener ~p closed", [ListenSocket]);
         {error, Error} ->
             %% A Wi-Fi glitch can make accept fail (ehostunreach, enomem, ...)
@@ -277,7 +286,7 @@ accept(ControllingProcess, ListenSocket) ->
             %% instead, with a pause so a persistent error does not spin.
             ?TRACE("Error accepting connection: ~p; retrying", [Error]),
             receive after 1000 -> ok end,
-            accept(ControllingProcess, ListenSocket)
+            accept(ControllingProcess, ListenSocket, Retries)
     end.
 
 
