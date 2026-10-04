@@ -39,7 +39,12 @@
 
 -record(state, {
     handler,
-    handler_state
+    handler_state,
+    %% The listening socket, kept so terminate/2 can close it: the acceptor is
+    %% spawned (not linked) and would otherwise keep the port bound after a
+    %% restart, so the next bind fails and connections are swallowed by the
+    %% orphaned acceptor.
+    socket
 }).
 
 -define(DEFAULT_BIND_OPTIONS, #{
@@ -90,7 +95,7 @@ init({BindOptions, SocketOptions, Handler, Args}) ->
                             spawn(fun() -> accept(Self, Socket) end),
                             case Handler:init(Args) of
                                 {ok, HandlerState} ->
-                                    {ok, #state{handler = Handler, handler_state = HandlerState}};
+                                    {ok, #state{handler = Handler, handler_state = HandlerState, socket = Socket}};
                                 HandlerError ->
                                     try_close(Socket),
                                     {stop, {handler_error, HandlerError}}
@@ -111,7 +116,7 @@ init({Socket, Handler, Args}) ->
     case Handler:init(Args) of
         {ok, HandlerState} ->
             spawn(fun() -> loop(Self, Socket) end),
-            {ok, #state{handler = Handler, handler_state = HandlerState}};
+            {ok, #state{handler = Handler, handler_state = HandlerState, socket = Socket}};
         HandlerError ->
             {stop, {handler_error, HandlerError}}
     end.
@@ -161,7 +166,10 @@ handle_info(Info, State) ->
     {noreply, State}.
 
 %% @hidden
-terminate(_Reason, _State) ->
+terminate(_Reason, #state{socket = Socket}) ->
+    %% Closing the listening socket also stops the acceptor (its accept returns
+    %% {error, closed}), which frees the port for a restart.
+    try_close(Socket),
     ok.
 
 %%
@@ -258,8 +266,18 @@ accept(ControllingProcess, ListenSocket) ->
             ?TRACE("Accepted connection from ~p", [socket:peername(Connection)]),
             spawn(fun() -> accept(ControllingProcess, ListenSocket) end),
             loop(ControllingProcess, Connection);
-        _Error ->
-            ?TRACE("Error accepting connection: ~p", [Error])
+        {error, closed} ->
+            %% The listener is gone; there is nothing left to accept.
+            ?TRACE("Listener ~p closed", [ListenSocket]);
+        {error, Error} ->
+            %% A Wi-Fi glitch can make accept fail (ehostunreach, enomem, ...)
+            %% while the listener stays open. Returning here leaves the server
+            %% bound but deaf: TCP connects are accepted by the stack and then
+            %% reset, and nothing short of a restart listens again. Retry
+            %% instead, with a pause so a persistent error does not spin.
+            ?TRACE("Error accepting connection: ~p; retrying", [Error]),
+            receive after 1000 -> ok end,
+            accept(ControllingProcess, ListenSocket)
     end.
 
 
