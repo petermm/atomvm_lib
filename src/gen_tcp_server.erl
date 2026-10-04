@@ -283,16 +283,25 @@ accept(ControllingProcess, ListenSocket) ->
 
 %% @private
 loop(ControllingProcess, Connection) ->
-    case socket:recv(Connection) of
+    %% `socket:recv' can raise (AtomVM's select teardown does, on a socket the
+    %% peer already closed) and the process would then exit without closing the
+    %% connection: LWIP_MAX_SOCKETS is small, so a few leaked fds leave the
+    %% listener unable to accept anything. Catch, close, and be done.
+    case catch socket:recv(Connection) of
         {ok, Data} ->
             ?TRACE("Received data ~p on connection ~p", [Data, Connection]),
             ControllingProcess ! {tcp, Connection, Data},
             loop(ControllingProcess, Connection);
         {error, closed} ->
             ?TRACE("Peer closed connection ~p", [Connection]),
+            try_close(Connection),
             ControllingProcess ! {tcp_closed, Connection},
             ok;
         {error, _SomethingElse} ->
             ?TRACE("Some other error occurred ~p", [Connection]),
-            try_close(Connection)
+            try_close(Connection);
+        {'EXIT', _Reason} ->
+            ?TRACE("recv raised on ~p; closing", [Connection]),
+            try_close(Connection),
+            ok
     end.
